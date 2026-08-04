@@ -1,0 +1,37 @@
+system: Brightwave Webinar Platform
+requesting_team: Marketing
+owner: ""
+purpose: Run customer webinars and capture attendee registrations for the demand-gen funnel.
+stage: proposed
+data_classes: [personal data, internal]
+record_volume: ~40,000 registrations per year
+data_residency: ""
+retention: ""
+users: [employees, customers, public]
+user_count: 12 staff, unlimited attendees
+hosting: saas
+vendor: Brightwave Inc
+vendor_attestations: []
+subprocessors: ""
+dpa_in_place: no
+sso: no
+mfa: ""
+privileged_roles: ""
+offboarding: ""
+internet_facing: yes
+network_notes: ""
+logging: ""
+log_destination: ""
+log_retention: ""
+integrations:
+  - name: Salesforce
+    direction: outbound
+    internal: yes
+    data_shared: [personal data]
+    auth_method: OAuth service account
+  - name: Brightwave analytics partner
+    direction: outbound
+    internal: no
+    data_shared: [personal data]
+regulated_regimes: []
+exit_plan: ""

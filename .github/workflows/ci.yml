@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy src/entsec
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: bandit -q -r src/entsec -c pyproject.toml
+      # `.` not the editable install: pip-audit --strict cannot resolve an
+      # editable install of the project itself on PyPI and exits 1.
+      - run: pip-audit --strict --desc on .
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python-version }}", cache: pip }
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: pytest
+
+  invariants:
+    name: review invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Framework references are complete and well formed
+        # These reach GRC trackers and audit conversations, where somebody
+        # looks them up. A blank or malformed identifier is worse than none.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re, sys
+          from entsec.controls.catalog import BUILTIN_CONTROLS
+          expected = {"NIST CSF 2.0", "ISO 27001:2022", "SOC 2 TSC", "CIS v8"}
+          patterns = {
+              "NIST CSF 2.0": re.compile(r"^(GV|ID|PR|DE|RS|RC)\.[A-Z]{2}$"),
+              "ISO 27001:2022": re.compile(r"^A\.[5-8]\.\d{1,2}$"),
+              "SOC 2 TSC": re.compile(r"^(CC[1-9]\.\d|[ACP]\d?\d?\.\d|PI\d\.\d)$"),
+              "CIS v8": re.compile(r"^Control (1[0-8]|[1-9])$"),
+          }
+          for entry in BUILTIN_CONTROLS:
+              names = {f.name for f in entry.frameworks}
+              if names != expected:
+                  sys.exit(f"{entry.id} maps to {names}, expected all four")
+              for f in entry.frameworks:
+                  if not patterns[f.name].match(f.identifier):
+                      sys.exit(f"{entry.id}: malformed {f.name} identifier {f.identifier!r}")
+          print(f"{len(BUILTIN_CONTROLS)} controls, all four frameworks, all identifiers well formed")
+          PY
+
+      - name: The decision is never read from model output
+        run: |
+          set -euo pipefail
+          if grep -rn 'raw.get("decision")\|raw\[.decision.\]\|get("severity")' src/entsec/; then
+            echo "::error::a model-supplied decision or severity is being read"; exit 1
+          fi
+          python - <<'PY'
+          import sys
+          from entsec.controls.evaluate import decide, evaluate
+          from entsec.intake import parse_intake
+          intake = parse_intake({"system": "S", "users": ["public"],
+                                 "data_classes": ["personal data"], "internet_facing": "yes"})
+          gaps, questions, _, _ = evaluate(intake)
+          first, _ = decide(gaps, questions, [])
+          second, _ = decide(gaps, questions, [])
+          if first is not second:
+              sys.exit("the decision is not reproducible")
+          if first.value != "changes_required":
+              sys.exit(f"expected changes_required for a blocking design, got {first.value}")
+          print(f"decision computed and reproducible: {first.value}")
+          PY
+
+      - name: Unknown is never treated as absent
+        # The failure mode that ends adoption: accusing a team of something
+        # they were never asked about.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from entsec.controls.evaluate import evaluate
+          from entsec.intake import parse_intake
+          base = {"system": "S", "users": ["employees"], "data_classes": ["internal"]}
+          blank = parse_intake(base)
+          gaps, questions, _, _ = evaluate(blank)
+          if [g for g in gaps if g.control_id == "IAM-02"]:
+              sys.exit("an unanswered MFA question produced a GAP instead of a question")
+          if not any("Multi-factor" in q.text for q in questions):
+              sys.exit("an unanswered MFA question produced neither a gap nor a question")
+          explicit = parse_intake({**base, "mfa": "no"})
+          if not [g for g in evaluate(explicit)[0] if g.control_id == "IAM-02"]:
+              sys.exit("an explicit 'no' did NOT produce a gap")
+          print("blank is a question, explicit no is a gap")
+          PY
+
+      - name: The gate rejects invented facts and control ids
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from entsec.analyze import gate
+          from entsec.intake import parse_intake
+          intake = parse_intake({"system": "S", "users": ["employees"]})
+          for bad, label in (
+              ({"title": "x", "chain": ["a"], "fact_ids": ["nope"], "control_ids": ["IAM-01"]}, "fact"),
+              ({"title": "x", "chain": ["a"], "fact_ids": ["system"], "control_ids": ["ZZZ-99"]}, "control id"),
+          ):
+              kept, rejected = gate.apply([bad], intake)
+              if kept or not rejected:
+                  sys.exit(f"the gate let an invented {label} through")
+          print("gate rejects invented facts and control ids")
+          PY
+
+      - name: check runs with no API key
+        run: |
+          set -euo pipefail
+          env -u ANTHROPIC_API_KEY entsec check -i intake.example.yml -o /dev/null && rc=0 || rc=$?
+          test "$rc" -eq 1 || { echo "expected exit 1 for a blocking example, got $rc"; exit 1; }
+          echo "check works with no key and fails a blocking design"
+
+  smoke:
+    name: end-to-end smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: The example intake produces the expected decision
+        run: |
+          set -euo pipefail
+          entsec check -i intake.example.yml -o review.md || true
+          grep -q "Changes required" review.md
+          grep -q "TPR-02" review.md
+          grep -qv 'gap\\(s\\)' review.md
+          echo "example review renders correctly"
+
+      - name: An empty intake exits 2, not 0
+        run: |
+          set -euo pipefail
+          printf 'system: ""\n' > empty.yml
+          entsec check -i empty.yml -o /dev/null && rc=0 || rc=$?
+          test "$rc" -eq 2 || { echo "expected exit 2 for an empty intake, got $rc"; exit 1; }
+          echo "an unfilled form fails loudly"
+
+      - name: A clean design is approved
+        run: |
+          set -euo pipefail
+          cat > clean.yml <<'YML'
+          system: Internal Runbook Wiki
+          requesting_team: Platform Engineering
+          owner: Dana Okafor
+          stage: design
+          data_classes: [internal]
+          users: [employees]
+          hosting: cloud
+          sso: yes
+          mfa: yes
+          internet_facing: no
+          privileged_roles: Four named platform engineers, reviewed quarterly.
+          offboarding: Standard leaver process through Okta deprovisioning.
+          logging: Sign-ins, edits, permission changes and admin actions.
+          network_notes: Corporate VPN only, from managed devices.
+          YML
+          entsec check -i clean.yml -o clean.md && rc=0 || rc=$?
+          test "$rc" -eq 0 || { echo "expected exit 0 for a clean design, got $rc"; exit 1; }
+          grep -q "Approved" clean.md
+          echo "a clean design is approved and exits 0"

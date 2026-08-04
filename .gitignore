@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# State and output. The baseline database is a map of every entry point, sink
+# and credential store in the system -- a working attack plan for anyone who
+# reads it. It does not belong in version control.
+.entsec/
+entsec.db
+review.md
+review.html
+review.json
