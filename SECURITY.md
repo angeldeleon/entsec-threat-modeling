@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report privately through GitHub's [private vulnerability reporting](https://github.com/angeldeleon/entsec/security/advisories/new) rather than opening a public issue.
+Report privately through GitHub's [private vulnerability reporting](https://github.com/angeldeleon/entsec-threat-modeling/security/advisories/new) rather than opening a public issue.
 
 Include affected version, reproduction steps, and impact. I aim to acknowledge within 72 hours and to ship a fix or mitigation plan within 30 days for confirmed issues.
 

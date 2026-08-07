@@ -28,4 +28,4 @@ ruff format . && ruff check . && mypy src/entsec && bandit -q -r src/entsec -c p
 
 ## Security issues
 
-Do not open a public issue. Use [private reporting](https://github.com/angeldeleon/entsec/security/advisories/new).
+Do not open a public issue. Use [private reporting](https://github.com/angeldeleon/entsec-threat-modeling/security/advisories/new).

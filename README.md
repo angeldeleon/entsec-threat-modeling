@@ -1,8 +1,8 @@
-# entsec
+# entsec-threat-modeling
 
-Security design review for enterprise environments. Another team wants to build, buy or connect something — entsec works out which controls apply, what is missing, and whether it can proceed.
+Threat modelling for enterprise security design reviews. Another team wants to build, buy or connect something — entsec works out which controls apply, what is missing, and whether it can proceed.
 
-[![CI](https://github.com/angeldeleon/entsec/actions/workflows/ci.yml/badge.svg)](https://github.com/angeldeleon/entsec/actions/workflows/ci.yml)
+[![CI](https://github.com/angeldeleon/entsec-threat-modeling/actions/workflows/ci.yml/badge.svg)](https://github.com/angeldeleon/entsec-threat-modeling/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
@@ -61,8 +61,10 @@ So the model is not in charge of anything that matters.
 ## Install
 
 ```bash
-pip install entsec
+pip install entsec-threat-modeling
 ```
+
+The command is `entsec`. The package name is longer so it says what it does on your profile and in search; the thing you type stays short.
 
 ## Usage
 
@@ -137,7 +139,7 @@ CI runs ruff, mypy, bandit and pip-audit, and asserts the invariants a review wo
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The most useful contribution is a control objective: one entry, its applicability rule, and its four framework references.
 
-Security issues: [private reporting](https://github.com/angeldeleon/entsec/security/advisories/new), not a public issue.
+Security issues: [private reporting](https://github.com/angeldeleon/entsec-threat-modeling/security/advisories/new), not a public issue.
 
 ## License
 
