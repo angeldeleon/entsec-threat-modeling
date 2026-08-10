@@ -340,7 +340,21 @@ class Intake:
     unanswered: list[str] = field(default_factory=list)
     """Questions left blank. Each becomes a candidate finding, because in a
     design review an unanswered question is a real gap and not a formatting
-    problem -- somebody has to go and find out."""
+    problem -- somebody has to go and find out.
+
+    Written in this repository: these are the questions from the form, quoted
+    back. Nothing the requester typed appears here."""
+
+    vocabulary_notes: list[str] = field(default_factory=list)
+    """Answers the parser could not map onto the taxonomy, quoted back so the
+    requester can say what they meant.
+
+    Kept apart from :attr:`unanswered` because these carry intake text and
+    those do not, and a renderer has to know which it is holding. Escape the
+    quoted answer or a data type named ``![](https://evil/px.png)`` puts an
+    image in the review; escape the form's own wording and
+    ``(GDPR, HIPAA, PCI DSS, other)`` reaches the reader with backslashes in
+    it."""
 
     document_lines: list[str] = field(default_factory=list)
     source_name: str = ""
@@ -429,6 +443,7 @@ class Intake:
             "exit_plan": self.exit_plan,
             "facts": [f.to_dict() for f in self.facts],
             "unanswered": self.unanswered,
+            "vocabulary_notes": self.vocabulary_notes,
         }
 
 
@@ -555,7 +570,19 @@ class Question:
     why_it_matters: str = ""
     blocks_decision: bool = False
     """True when the answer would change the outcome. These are why the decision
-    can come back as insufficient-information rather than a guess."""
+    can come back as insufficient-information rather than a guess.
+
+    Only the control evaluation sets this. A question that arrives from the
+    analysis layer is displayed and never blocks, because blocking moves the
+    decision and the decision is not the model's to move."""
+
+    trusted: bool = True
+    """False when the text quotes something the requester or the model wrote.
+
+    Provenance rather than a safety switch, and it has to travel with the
+    question for the same reason it travels with a condition: the renderer
+    escapes untrusted text and leaves the form's own wording alone, and it
+    cannot tell them apart by looking."""
 
     def to_dict(self) -> dict[str, Any]:
         return {

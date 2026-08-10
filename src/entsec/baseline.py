@@ -1,22 +1,23 @@
-"""Baseline storage, and the drift comparison that gives the tool its name.
+"""Baseline storage, and the comparison that makes the second review short.
 
-A one-shot threat model is a document. A threat model with a baseline is a
-control: it runs on every design change and answers the only question anyone
-asks after the first review, which is *what did we just add*.
+A one-shot design review is a document. A review with a baseline is a process:
+it runs again when the design changes and answers the only question anybody asks
+the second time, which is *what did that change introduce*.
 
-That reframing is what makes this usable in CI. Nobody merges a pull request
-after reading a forty-item threat model. They will read "this PR introduces one
-new internet-reachable path to customer data" and act on it.
+Designs come back. A vendor is swapped, a data type is added, an integration
+appears -- and re-reading a full review each time is how the review ends up
+skipped. "This revision adds one outbound feed of personal data to an external
+party" is a sentence a requesting team will actually act on.
 
-Two properties matter for the diff to be trustworthy:
+Two properties matter for the comparison to be trustworthy:
 
-* **Structural keys.** Paths are compared by which components they traverse,
-  not by title. Model wording varies run to run; if a reworded description of a
-  known path showed up as new exposure, the diff would fill with noise and the
-  reader would learn to ignore it. See :meth:`Finding.key`.
-* **Scoped state.** Two repositories sharing a state file get separate
-  baselines. Without that, every run would diff against an unrelated system,
-  find nothing in common, and report the whole model as new.
+* **Structural keys.** Findings are compared by which facts and controls they
+  rest on, not by title. Wording varies between runs; if a reworded description
+  of a known risk showed up as newly introduced, the comparison would fill with
+  noise and the reader would learn to ignore it. See :meth:`Finding.key`.
+* **Scoped state.** Two systems sharing a state file get separate baselines.
+  Without that, every run would compare against an unrelated system, find
+  nothing in common, and report the whole review as new.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import stat
 from contextlib import closing
 from pathlib import Path
 
-from .models import Finding, Intake, Review
+from .models import Intake, Review
 
 log = logging.getLogger(__name__)
 
@@ -74,11 +75,17 @@ CREATE INDEX IF NOT EXISTS idx_run_paths_run ON run_paths (run_id);
 
 
 def state_scope(intake: Intake) -> str:
-    """Namespace for one analysed system.
+    """Namespace for one reviewed system.
 
-    Derived from the source identifier rather than the display name, so
-    renaming a project in config does not orphan its history and start every
-    finding over as new.
+    The declared system name, case-folded, is the identity. It is the only
+    stable handle a design review has: there is no repository, no package and no
+    URL, and the file the intake happens to arrive in is named after whoever
+    sent it.
+
+    The cost is that renaming the system on the form starts a new history --
+    ``rereview`` will report there is no previous review rather than comparing
+    against one. That is the honest failure: comparing a renamed system against
+    a different one would be worse, and it would be silent.
     """
     return hashlib.sha256(intake.system.casefold().encode("utf-8")).hexdigest()[:16]
 
@@ -271,47 +278,13 @@ class BaselineStore:
         )
         connection.execute("DELETE FROM runs WHERE scope = ? AND id <= ?", (self.scope, threshold))
 
-    def titles_for(self, path_keys: list[str]) -> list[str]:
-        """Titles for specific path keys within this scope, most recent first.
-
-        Filtered in Python rather than with a generated ``IN (?, ?, ...)`` list.
-        The placeholders would be safe -- they are only commas and question
-        marks -- but building SQL from a variable number of them is the shape
-        static analysis flags, and arguing with the analyser on every run costs
-        more than the row scan does. Retention caps this at 20 runs.
-        """
-        if not path_keys:
-            return []
-        wanted = set(path_keys)
-        with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT rp.path_key, rp.title FROM run_paths rp "
-                "JOIN runs r ON r.id = rp.run_id "
-                "WHERE r.scope = ? ORDER BY rp.run_id DESC",
-                (self.scope,),
-            ).fetchall()
-        titles: list[str] = []
-        seen: set[str] = set()
-        for key, title in rows:
-            if str(key) in wanted and str(title) not in seen:
-                seen.add(str(title))
-                titles.append(str(title))
-        return titles
-
-    def run_count(self) -> int:
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) FROM runs WHERE scope = ?", (self.scope,)
-            ).fetchone()
-            return int(row[0]) if row else 0
-
 
 def apply_baseline(result: Review, store: BaselineStore) -> None:
-    """Mark which paths are new, in place.
+    """Mark which findings are new, in place.
 
-    A first run marks nothing as new. Reporting every path as newly introduced
-    on the first run would be technically true and completely useless, and it
-    trains the reader that the "new" marker means nothing.
+    A first run marks nothing as new. Reporting every finding as newly
+    introduced on the first review would be technically true and completely
+    useless, and it teaches the reader that the "new" marker means nothing.
     """
     previous = store.previous()
     if previous is None:
@@ -324,9 +297,9 @@ def apply_baseline(result: Review, store: BaselineStore) -> None:
     result.new_finding_keys = {f.key() for f in result.findings if f.key() not in known_keys}
 
     if fingerprint == result.intake.fingerprint():
-        # Same structural model as last time. Any path difference is model
-        # variance, not new exposure, and saying so is more honest than
-        # presenting it as a change to the system.
+        # The same declared design as last time. Any difference in the findings
+        # is analysis variation, not new exposure, and saying so is more honest
+        # than presenting it as a change to the system.
         result.notes.append(
             "The declared design is unchanged since the last review "
             f"(fingerprint {fingerprint}). Differences below reflect analysis variation, "
@@ -337,27 +310,3 @@ def apply_baseline(result: Review, store: BaselineStore) -> None:
             f"The declared design changed since the last review ({fingerprint} → "
             f"{result.intake.fingerprint()}); {len(result.new_finding_keys)} finding(s) are new."
         )
-
-
-def resolved_paths(result: Review, store: BaselineStore) -> list[str]:
-    """Titles of paths present in the last run and absent now.
-
-    The first version selected DISTINCT title over *every* path in the last run,
-    then took an alphabetical slice of length len(gone) -- so it named findings
-    that were still open and omitted the ones actually fixed. It also had no
-    scope predicate, so titles from an unrelated repository sharing a state file
-    could be returned. Now it looks up exactly the keys that disappeared.
-    """
-    previous = store.previous()
-    if previous is None:
-        return []
-    _, known_keys = previous
-    gone = sorted(known_keys - {f.key() for f in result.findings})
-    if not gone:
-        return []
-    return store.titles_for(gone)
-
-
-def key_of(path: Finding) -> str:
-    """Public accessor, so callers do not reach into the dataclass."""
-    return path.key()

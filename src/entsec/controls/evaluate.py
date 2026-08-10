@@ -218,13 +218,27 @@ def unanswered_questions(intake: Intake) -> list[Question]:
     rather than in the design. A requester who left a field blank has not
     necessarily built anything wrong; they have left something for us to ask.
     """
+    # An answer the parser could not place comes first. It is the one item here
+    # a requester can settle in a sentence, and until they do, every control
+    # that depends on it never fired at all. Marked untrusted because it quotes
+    # what they typed, where the blanks below quote the form.
+    questions = [
+        Question(
+            text=note,
+            why_it_matters="An answer was given but could not be mapped onto the taxonomy.",
+            blocks_decision=False,
+            trusted=False,
+        )
+        for note in intake.vocabulary_notes[:8]
+    ]
+
     # Capped at eight. Every blank is a real gap in the form, but a review that
     # opens with thirty questions reads as a rejection of the requester rather
     # than a list they can work through -- and the ones that actually matter are
     # already surfaced as blocking questions by the control evaluation. The
     # remainder are counted rather than listed, so nothing is hidden.
     listed = intake.unanswered[:8]
-    questions = [
+    questions += [
         Question(
             text=text,
             why_it_matters="Left blank on the intake form.",

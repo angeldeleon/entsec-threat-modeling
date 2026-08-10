@@ -28,7 +28,7 @@ from typing import Any
 from ..controls.catalog import BUILTIN_CONTROLS
 from ..httpclient import HTTPError, post_json
 from ..models import ControlGap, Finding, Intake, Question
-from ..validation import ValidationError, safe_text
+from ..validation import ValidationError, safe_text, sanitise
 from . import gate
 from .prompt import ANALYSIS_TOOL, SYSTEM_PROMPT, build_user_message
 
@@ -158,6 +158,19 @@ def _extract_tool_input(response: dict[str, Any]) -> dict[str, Any]:
 
 
 def _questions(raw: dict[str, Any]) -> list[Question]:
+    """Questions the model would ask. Displayed, never load-bearing.
+
+    ``blocks_decision`` is set here rather than read. A blocking question is
+    what turns a review from approved into insufficient-information and fails
+    the exit code, so a model marking its own questions as blocking would be
+    moving the decision -- the one thing the split in this tool exists to
+    prevent, and the one claim in the README that has to hold literally.
+    Closing it cost nothing: the question still appears, under open questions
+    rather than blocking ones.
+
+    ``trusted`` is False because the text is written by the model out of intake
+    another team typed, and it lands in a document that goes to a ticket.
+    """
     questions: list[Question] = []
     items = raw.get("questions")
     if not isinstance(items, list):
@@ -165,14 +178,15 @@ def _questions(raw: dict[str, Any]) -> list[Question]:
     for item in items[:6]:
         if not isinstance(item, dict):
             continue
-        text = safe_text(item.get("text") or "", limit=400)
+        text = sanitise(item.get("text") or "", limit=400)
         if not text:
             continue
         questions.append(
             Question(
                 text=text,
-                why_it_matters=safe_text(item.get("why_it_matters") or "", limit=400),
-                blocks_decision=bool(item.get("blocks_decision")),
+                why_it_matters=sanitise(item.get("why_it_matters") or "", limit=400),
+                blocks_decision=False,
+                trusted=False,
             )
         )
     return questions

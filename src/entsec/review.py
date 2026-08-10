@@ -13,6 +13,7 @@ a defence.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from .analyze.engine import Analyzer
@@ -98,12 +99,19 @@ def full(intake: Intake, analyzer: Analyzer, *, tool_version: str = "") -> Revie
 
 
 def _merge_questions(existing: list[Question], incoming: list[Question]) -> list[Question]:
-    """Add model questions, skipping anything already asked.
+    """Add questions from the analysis layer, skipping anything already asked.
 
     Matched on a normalised prefix rather than exact text, because the model
     will reliably reword a question the form already asked, and a review that
     asks the same thing twice in different words reads as though nobody
     proof-read it.
+
+    Nothing arriving here blocks. A blocking question is what turns an approval
+    into insufficient-information and what makes the exit code 1, so it is part
+    of the verdict — and the verdict is computed from the intake, which is the
+    claim this tool rests on. This is the boundary where analysis-layer
+    questions enter a review, so it is where that is enforced rather than in the
+    code that happens to produce them today.
     """
     seen = {q.text.casefold()[:60] for q in existing}
     merged = list(existing)
@@ -112,7 +120,7 @@ def _merge_questions(existing: list[Question], incoming: list[Question]) -> list
         if key in seen:
             continue
         seen.add(key)
-        merged.append(question)
+        merged.append(replace(question, blocks_decision=False))
     merged.sort(key=lambda q: (not q.blocks_decision, q.text))
     return merged
 

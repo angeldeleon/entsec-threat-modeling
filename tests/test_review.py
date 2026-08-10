@@ -7,24 +7,34 @@ that moves between runs on the same inputs is worth nothing to anybody.
 
 from __future__ import annotations
 
+import time
+from dataclasses import fields
+
 import pytest
 
 from entsec.analyze import gate
+from entsec.analyze.engine import _questions
+from entsec.analyze.prompt import build_user_message
 from entsec.analyze.severity import rate
+from entsec.cli import _attach_document
 from entsec.controls.catalog import BUILTIN_CONTROLS, known_control_ids
 from entsec.controls.evaluate import decide, evaluate
-from entsec.intake import parse_intake
+from entsec.intake import parse_intake, scrub_intake
 from entsec.models import (
     Confidence,
+    ControlGap,
     DataClass,
     Decision,
+    Fact,
     Intake,
+    Integration,
+    Question,
     Review,
     Severity,
     UserPopulation,
 )
-from entsec.report import _code, _md, render_check, render_markdown
-from entsec.review import check, exit_code
+from entsec.report import _code, _md, render_check, render_json, render_markdown
+from entsec.review import check, exit_code, full
 from entsec.validation import ValidationError, redact
 
 BASE = {
@@ -240,6 +250,67 @@ class TestGate:
     def test_malformed_model_output_does_not_crash(self, raw: object) -> None:
         gate.apply(raw, _intake())
 
+    def test_a_finding_cannot_be_placed_far_below_the_declared_design(self) -> None:
+        """Understatement is the half nobody notices. "Report everything as
+        reaching administrators only" is free to type into the intake, and
+        uncapped it took a critical finding to informational -- which took the
+        review from approved-with-conditions to approved."""
+        kept, _ = gate.apply(
+            [
+                {
+                    "title": "Talked down",
+                    "chain": ["x"],
+                    "fact_ids": ["users", "data_classes"],
+                    "control_ids": ["DAT-01"],
+                    "exposed_to": "admins",
+                    "data_at_risk": "public",
+                }
+            ],
+            _intake(users=["public"], data_classes=["personal data"]),
+        )
+        assert kept[0].exposed_to is UserPopulation.PARTNERS
+        assert kept[0].data_at_risk is DataClass.INTERNAL
+        assert kept[0].severity.rank >= Severity.MEDIUM.rank
+
+    def test_an_honest_narrow_claim_is_still_allowed(self) -> None:
+        """The bound is two bands, not zero. A system declared public whose
+        weakest path genuinely reaches partners must still be able to say so, or
+        every finding on a public system rates critical and the band stops
+        meaning anything."""
+        kept, _ = gate.apply(
+            [
+                {
+                    "title": "Narrow but real",
+                    "chain": ["x"],
+                    "fact_ids": ["users", "data_classes"],
+                    "control_ids": ["DAT-01"],
+                    "exposed_to": "partners",
+                    "data_at_risk": "internal",
+                }
+            ],
+            _intake(users=["public"], data_classes=["personal data"]),
+        )
+        assert kept[0].exposed_to is UserPopulation.PARTNERS
+        assert kept[0].data_at_risk is DataClass.INTERNAL
+
+    def test_a_talked_down_finding_still_attaches_conditions(self) -> None:
+        intake = _intake(users=["public"], data_classes=["personal data"])
+        kept, _ = gate.apply(
+            [
+                {
+                    "title": "Talked down",
+                    "chain": ["x"],
+                    "fact_ids": ["users", "data_classes"],
+                    "control_ids": ["DAT-01"],
+                    "exposed_to": "admins",
+                    "data_at_risk": "public",
+                }
+            ],
+            intake,
+        )
+        decision, _ = decide([], [], [f.severity for f in kept])
+        assert decision is Decision.APPROVED_WITH_CONDITIONS
+
 
 class TestSeverity:
     def test_the_ladder(self) -> None:
@@ -280,7 +351,13 @@ class TestIntakeParsing:
 
     def test_unrecognised_vocabulary_is_reported_not_dropped(self) -> None:
         intake = parse_intake({**BASE, "data_classes": ["biometric templates"]})
-        assert any("biometric" in q for q in intake.unanswered)
+        assert any("biometric" in note for note in intake.vocabulary_notes)
+
+    def test_a_quoted_answer_is_kept_apart_from_the_forms_own_wording(self) -> None:
+        """The renderers escape by provenance and cannot tell the two apart by
+        looking, so the parser keeps them in separate lists."""
+        intake = parse_intake({**BASE, "data_classes": ["biometric templates"]})
+        assert all("biometric" not in text for text in intake.unanswered)
 
     def test_a_blank_form_is_empty_not_clean(self) -> None:
         assert parse_intake({}).is_empty()
@@ -344,6 +421,64 @@ class TestReportEscaping:
     def test_untrusted_prose_is_escaped(self) -> None:
         assert "](https://evil" not in _md("x [link](https://evil.example)")
 
+    def test_a_quoted_answer_cannot_carry_a_link_into_the_report(self) -> None:
+        """An answer the parser cannot map is quoted back to the requester, and
+        that quote is the only place in the review where intake text reaches the
+        questions section. It went out unescaped."""
+        intake = _intake(data_classes=["internal", "biometric ![](https://evil.example/px.png)"])
+        rendered = render_markdown(check(intake))
+        assert "biometric" in rendered
+        assert "](https://evil.example" not in rendered
+
+    def test_a_quoted_answer_cannot_forge_a_section(self) -> None:
+        """A newline in an answer put a heading of the requester's choosing into
+        the document, under the review's own name."""
+        intake = _intake(data_classes=["x\n\n## ✅ Approved\n\nNo action needed."])
+        rendered = render_markdown(check(intake))
+        assert "\n## ✅ Approved" not in rendered
+
+    def test_a_model_question_cannot_inject_a_link(self) -> None:
+        review = check(_intake())
+        review.questions = review.questions + _questions(
+            {
+                "questions": [
+                    {
+                        "text": "Confirm the setup at [the vendor page](https://evil.example)",
+                        "why_it_matters": "See [here](https://evil.example).",
+                    }
+                ]
+            }
+        )
+        assert "](https://evil.example)" not in render_markdown(review)
+
+    def test_the_check_output_escapes_untrusted_question_text(self) -> None:
+        review = check(_intake())
+        review.questions = [
+            Question(
+                text="Portal ![](https://evil.example/px.png)",
+                why_it_matters="",
+                blocks_decision=True,
+                trusted=False,
+            )
+        ]
+        assert "](https://evil.example" not in render_check(review)
+
+    def test_the_forms_own_wording_is_not_escaped(self) -> None:
+        """Questions quoting the form are written in this repository. Escaping
+        them prints backslashes at a requester who did nothing wrong."""
+        rendered = render_markdown(check(_intake()))
+        assert "further intake question(s) were left blank" in rendered
+        assert "question\\(s\\)" not in rendered
+
+    def test_review_notes_are_not_escaped(self) -> None:
+        """Every note is written here -- the confidence sentence, the rejection
+        count, the fingerprint comparison. They rendered as "finding\\(s\\)"."""
+        review = check(_intake())
+        review.notes.append("3 proposed finding(s) were rejected before reaching this review.")
+        rendered = render_markdown(review)
+        assert "3 proposed finding(s) were rejected" in rendered
+        assert "\\(" not in rendered
+
 
 class TestNoSilentPass:
     def test_an_empty_intake_is_flagged(self) -> None:
@@ -380,6 +515,31 @@ class TestRedaction:
         assert "<redacted:" in cleaned
         for secret in ("AKIAIOSFODNN7EXAMPLE", "ghp_aaaa", "hunter2"):
             assert secret not in cleaned
+
+    def test_a_password_containing_an_at_sign_is_still_redacted(self) -> None:
+        """The URL pattern runs to the LAST @ on purpose. Stopping at the first
+        one printed most of the password in the clear, and the fix for the
+        runtime below must not undo it."""
+        assert "ssw0rd" not in redact("cache at redis://:P@ssw0rd@cache.internal:6379")
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "a://" * 40_000,
+            ("x://" + "b" * 20) * 20_000,
+            "eyJ" * 40_000,
+        ],
+    )
+    def test_redaction_stays_linear_on_a_hostile_answer(self, hostile: str) -> None:
+        """ "a://" repeated is a perfectly valid thing to type into "what does
+        this connect to", and it used to cost time quadratic in its length: 34
+        seconds of CPU for a 200 KB intake, inside `check`, which is the command
+        that makes no network call and is meant to be the cheap one. The bound
+        is deliberately loose -- the point is the shape of the curve, not a
+        millisecond budget on somebody's laptop."""
+        started = time.perf_counter()
+        redact(hostile)
+        assert time.perf_counter() - started < 5.0
 
 
 class TestSecretsNeverLeaveTheBoundary:
@@ -420,6 +580,252 @@ class TestSecretsNeverLeaveTheBoundary:
     def test_ordinary_answers_survive_intact(self) -> None:
         intake = parse_intake({**BASE, "offboarding": "Okta deprovisioning, verified monthly."})
         assert intake.offboarding == "Okta deprovisioning, verified monthly."
+
+    def test_a_credential_split_by_an_invisible_character_is_still_redacted(self) -> None:
+        """Redaction used to run before sanitising. A zero-width space inside a
+        key meant nothing matched, and the very next step deleted the zero-width
+        space and put the key back together -- in the stored value, in the API
+        payload and in the report. Every pattern could be beaten this way, by
+        anyone who can type into the form."""
+        intake = parse_intake({**BASE, "privileged_roles": "svc key AKIA​IOSFODNN7EXAMPLE"})
+        assert "AKIAIOSFODNN7EXAMPLE" not in intake.privileged_roles
+        assert "<redacted:" in intake.privileged_roles
+
+    def test_a_bare_integration_entry_is_redacted_like_any_other_answer(self) -> None:
+        """`integrations: [postgres://svc:pw@db/app]` is the obvious way to
+        answer "what does it connect to". It took a branch that sanitised
+        without redacting, so the password went to the API and into the JSON
+        report while the same string in mapping form was redacted."""
+        intake = parse_intake(
+            {**BASE, "integrations": ["postgres://svc:hunter2@db.internal:5432/app"]}
+        )
+        gaps, _, applicable, _ = evaluate(intake)
+        assert "hunter2" not in intake.integrations[0].name
+        assert "hunter2" not in build_user_message(intake, gaps, applicable)
+        assert "hunter2" not in render_json(check(intake))
+
+    def test_a_quoted_answer_is_redacted_before_it_is_quoted_back(self) -> None:
+        """An answer the parser could not map is repeated to the requester. It
+        was interpolated raw, so it inherited neither the redaction nor the
+        sanitising every other answer gets."""
+        intake = parse_intake({**BASE, "data_classes": ["biometric AKIAIOSFODNN7EXAMPLE"]})
+        gaps, _, applicable, _ = evaluate(intake)
+        assert all("AKIAIOSFODNN7EXAMPLE" not in n for n in intake.vocabulary_notes)
+        assert "AKIAIOSFODNN7EXAMPLE" not in build_user_message(intake, gaps, applicable)
+        assert "AKIAIOSFODNN7EXAMPLE" not in render_markdown(check(intake))
+
+    def test_an_attached_design_document_is_redacted_before_it_is_sent(self, tmp_path) -> None:
+        """`-d` sends the file in full, which makes it the input most likely to
+        hold a real credential -- an architecture note with a connection string,
+        a runbook with a service-account key. It went from the file straight
+        into the prompt while the README said otherwise."""
+        document = tmp_path / "design.md"
+        document.write_text(
+            "Auth: api_key = AKIAIOSFODNN7EXAMPLE\n"
+            "DB: postgres://svc:hunter2@db/app\n"
+            "CI: token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            encoding="utf-8",
+        )
+        intake = _intake()
+        _attach_document(intake, str(document))
+        gaps, _, applicable, _ = evaluate(intake)
+        payload = build_user_message(intake, gaps, applicable)
+        for secret in ("AKIAIOSFODNN7EXAMPLE", "hunter2", "ghp_aaaa"):
+            assert secret not in payload
+        assert "<redacted:" in "\n".join(intake.document_lines)
+
+    def test_model_prose_is_redacted_before_it_is_stored(self) -> None:
+        """A finding quotes the design back at the reader, and it is written to
+        the review database as well as the report. The intake it was written
+        from is redacted, so nothing should get this far -- which is the reason
+        to close it rather than to argue about whether it can happen."""
+        kept, _ = gate.apply(
+            [
+                {
+                    "title": "Shared credential AKIAIOSFODNN7EXAMPLE in the runbook",
+                    "chain": ["operator reads postgres://svc:hunter2@db/app"],
+                    "fact_ids": ["users"],
+                    "control_ids": ["IAM-04"],
+                    "exposed_to": "employees",
+                    "data_at_risk": "internal",
+                    "condition": "Rotate AKIAIOSFODNN7EXAMPLE.",
+                }
+            ],
+            _intake(),
+        )
+        finding = kept[0]
+        rendered = " ".join([finding.title, *finding.chain, finding.condition])
+        assert "AKIAIOSFODNN7EXAMPLE" not in rendered
+        assert "hunter2" not in rendered
+        assert finding.control_ids == ("IAM-04",)
+
+    def test_a_design_document_survives_readably(self, tmp_path) -> None:
+        """Redaction that eats the prose makes the attachment pointless."""
+        document = tmp_path / "design.md"
+        document.write_text("Attendees register through the vendor portal.\n", encoding="utf-8")
+        intake = _intake()
+        _attach_document(intake, str(document))
+        assert intake.document_lines == ["Attendees register through the vendor portal."]
+
+
+_SECRET = "AKIAIOSFODNN7EXAMPLE"
+
+# Field types on the model that carry no free text: a fixed vocabulary defined
+# in this repository, or a tri-state boolean. Anything else has to be planted
+# by the test below, and a new shape has to be added here deliberately rather
+# than by being forgotten.
+_NO_FREE_TEXT = frozenset(
+    {
+        "tuple[DataClass, ...]",
+        "tuple[UserPopulation, ...]",
+        "Hosting | None",
+        "bool | None",
+    }
+)
+
+
+def _planted(annotation: str) -> object | None:
+    """A value of the right shape with a credential inside it."""
+    if annotation == "str":
+        return f"key {_SECRET}"
+    if annotation == "list[str]":
+        return [f"key {_SECRET}"]
+    if annotation == "tuple[str, ...]":
+        return (f"key {_SECRET}",)
+    if annotation == "list[Fact]":
+        return [Fact(id="x", question="q", value=f"key {_SECRET}", source=f"{_SECRET}.yml")]
+    if annotation == "tuple[Integration, ...]":
+        return (
+            Integration(
+                name=f"key {_SECRET}",
+                direction="unknown",
+                auth_method=f"key {_SECRET}",
+                notes=f"key {_SECRET}",
+            ),
+        )
+    return None
+
+
+class TestTheScrubIsAChokePoint:
+    """Calling the cleaner at each parse site is a discipline, and disciplines
+    fail quietly. Three fields reached the API with credentials in them because
+    of exactly that, each one missing a single call. The guarantee is made over
+    the finished model instead, so a field added next year is covered whether or
+    not whoever adds it reads that file."""
+
+    def test_every_field_on_the_model_is_scrubbed(self) -> None:
+        intake = Intake()
+        planted = 0
+        for spec in fields(Intake):
+            value = _planted(str(spec.type))
+            if value is None:
+                assert str(spec.type) in _NO_FREE_TEXT, (
+                    f"Intake.{spec.name} is a {spec.type}, which this test does not know "
+                    "how to plant a credential in. Teach it, or the scrub is being taken "
+                    "on trust for that field."
+                )
+                continue
+            setattr(intake, spec.name, value)
+            planted += 1
+
+        assert planted >= 20, "the planting loop stopped covering the model"
+        before = repr([getattr(intake, spec.name) for spec in fields(Intake)])
+        assert _SECRET in before
+
+        scrub_intake(intake)
+
+        after = repr([getattr(intake, spec.name) for spec in fields(Intake)])
+        assert _SECRET not in after
+
+    def test_the_scrub_leaves_the_taxonomy_alone(self) -> None:
+        """Enum members subclass str. Cleaning one would replace it with a plain
+        string that no longer compares equal, and every applicability rule that
+        tests membership would silently stop firing."""
+        intake = _intake(data_classes=["personal data"], users=["public"], hosting="saas")
+        scrub_intake(intake)
+        assert DataClass.PII in intake.data_classes
+        assert UserPopulation.PUBLIC in intake.users
+        assert intake.hosting is not None and intake.hosting.value == "saas"
+
+    def test_the_scrub_is_idempotent(self) -> None:
+        """It runs again when a document is attached, and a placeholder must not
+        be mistaken for a secret on the second pass."""
+        intake = _intake(privileged_roles="key AKIAIOSFODNN7EXAMPLE")
+        once = scrub_intake(intake).privileged_roles
+        assert scrub_intake(intake).privileged_roles == once
+
+
+class _StubAnalyzer:
+    """Stands in for the reasoning layer, so the wiring can be tested without a
+    network call. Returns whatever it was handed."""
+
+    def __init__(self, questions: list[Question]) -> None:
+        self.questions = questions
+
+    def analyze(
+        self, intake: Intake, gaps: list[ControlGap], applicable: list[str]
+    ) -> tuple[list[object], list[Question], list[object], str]:
+        return [], self.questions, [], "stub-model"
+
+
+class TestTheDecisionIsNotTheModelsToMove:
+    """The split is the design: the model contributes findings, and the verdict
+    is computed. A question marked as blocking is what turns an approval into
+    insufficient-information and fails the exit code, so it is part of the
+    verdict."""
+
+    def test_the_analysis_layer_cannot_mark_its_own_questions_blocking(self) -> None:
+        produced = _questions(
+            {
+                "questions": [
+                    {
+                        "text": "Who owns the SAML metadata refresh?",
+                        "why_it_matters": "Nobody named it.",
+                        "blocks_decision": True,
+                    }
+                ]
+            }
+        )
+        assert produced and not any(q.blocks_decision for q in produced)
+        assert not any(q.trusted for q in produced)
+
+    def test_a_model_question_does_not_change_the_verdict(self) -> None:
+        intake = parse_intake(
+            {
+                "system": "Runbook Wiki",
+                "requesting_team": "Platform",
+                "owner": "Dana Okafor",
+                "stage": "design",
+                "data_classes": ["internal"],
+                "users": ["employees"],
+                "hosting": "cloud",
+                "sso": "yes",
+                "mfa": "yes",
+                "internet_facing": "no",
+                "privileged_roles": "Four named platform engineers, reviewed quarterly.",
+                "offboarding": "Standard leaver process through Okta deprovisioning.",
+                "logging": "Sign-ins, edits, permission changes and admin actions.",
+                "network_notes": "Corporate VPN only, from managed devices.",
+            }
+        )
+        assert check(intake).decision is Decision.APPROVED
+
+        # Blocking on the way in, on purpose: the enforcement has to sit at the
+        # boundary where these enter a review, not in the code that happens to
+        # produce them today.
+        analyzer = _StubAnalyzer(
+            [Question(text="One more thing", blocks_decision=True, trusted=False)]
+        )
+        result = full(intake, analyzer)  # type: ignore[arg-type]
+        assert result.decision is Decision.APPROVED
+        assert not result.blocking_questions()
+        assert exit_code(result, "high") == 0
+
+    def test_a_model_question_still_reaches_the_reader(self) -> None:
+        """Closing the hole must not silently drop the question."""
+        analyzer = _StubAnalyzer([Question(text="One more thing", trusted=False)])
+        result = full(_intake(), analyzer)  # type: ignore[arg-type]
+        assert any(q.text == "One more thing" for q in result.questions)
 
 
 class TestConditionProvenance:

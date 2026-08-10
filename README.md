@@ -52,7 +52,7 @@ So the model is not in charge of anything that matters.
 
 **The model may only cite what exists.** Findings must reference intake facts the requesting team actually declared and control identifiers that are in the catalog. Anything else is dropped before you see it, and the drop is counted. An invented control reference is the most damaging error this tool could make — it survives into a ticket, into a GRC tracker, and into an audit conversation where somebody looks it up.
 
-**Claims are clamped to the declared design.** A finding cannot claim wider exposure than the intake declares, or more sensitive data than the requester said the system holds. The model cannot make a system scarier than its own form.
+**Claims are clamped to the declared design, in both directions.** A finding cannot claim wider exposure than the intake declares, or more sensitive data than the requester said the system holds — and it cannot claim much less either. Understatement is the half nobody notices: severity is computed from who is exposed and what is at risk, so a real risk described as reaching administrators only is a real risk nobody acts on. A claim may sit at most two bands below the declared design.
 
 **Severity is arithmetic.** Ask a model for a rating and it anchors on the drama of its own prose. Ratings here come from who is exposed, what data is at risk, and how many preconditions are unverified.
 
@@ -115,7 +115,7 @@ Comparison is on the *structure* of the declared design, not its wording, so rep
 
 `check`, `questions` and `controls` send nothing. They are local and need no key.
 
-`review` and `rereview` send the intake answers and, if you attach one with `-d`, the design document in full — prose cannot be summarised without losing what makes it useful. Credential-shaped strings are redacted before anything is sent. If a design document is too sensitive to leave your network, run `check` and do the reasoning half yourself; the control evaluation and the decision are identical either way.
+`review` and `rereview` send the intake answers and, if you attach one with `-d`, the design document in full — prose cannot be summarised without losing what makes it useful. Credential-shaped strings are redacted in both, at one boundary, before anything is sent. If a design document is too sensitive to leave your network, run `check` and do the reasoning half yourself; the control evaluation and the decision are identical either way.
 
 The review history database is a list of every system reviewed and every gap found. It is created `0600` and gitignored by default.
 
@@ -131,9 +131,9 @@ Worth knowing before you rely on it:
 
 ## Security design
 
-Full detail in [SECURITY.md](SECURITY.md). The short version: intake is `yaml.safe_load` only with unknown keys rejected; intake text is treated as attacker-influenced and escaped per renderer; credential shapes are redacted before transmission; the API base is SSRF-guarded and redirects are refused; review history is SQLite at `0600` opened with `O_NOFOLLOW`.
+Full detail in [SECURITY.md](SECURITY.md). The short version: intake is `yaml.safe_load` only with unknown keys rejected; every string on a parsed intake is sanitised then redacted by one pass over the finished model, the design document included; text is escaped per renderer and by provenance, so an answer somebody typed cannot forge a line and the tool's own prose is not printed with backslashes in it; the API base is SSRF-guarded and redirects are refused; review history is SQLite at `0600` opened with `O_NOFOLLOW`.
 
-CI runs ruff, mypy, bandit and pip-audit, and asserts the invariants a review would miss — including that no framework identifier in the catalog is malformed, and that the decision is never read from model output.
+CI runs ruff, mypy, bandit and pip-audit, and asserts the invariants a review would miss — that no framework identifier in the catalog is malformed, that the decision is never read from model output, and that nothing credential-shaped reaches the API payload or any of the three report formats.
 
 ## Contributing
 

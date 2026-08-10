@@ -1,9 +1,9 @@
 """The control catalog: what a design review checks, and why it applies.
 
-One reviewable table, for the same reason fleetdrift keeps its osquery pack in
-the source tree. A security team adopting this needs to read what it will be
-held to before it points the thing at a colleague's project, and "read the code"
-is not an acceptable answer to that.
+One reviewable table, in one file, and printed in full by ``entsec controls``. A
+security team adopting this needs to read what it will be held to before it
+points the thing at a colleague's project, and "read the code" is not an
+acceptable answer to that.
 
 Three properties make this different from the checklist in a wiki:
 
@@ -730,10 +730,6 @@ BUILTIN_CONTROLS: tuple[Control, ...] = (
 
 
 CONTROLS_BY_ID: dict[str, Control] = {c.id: c for c in BUILTIN_CONTROLS}
-
-
-def control(control_id: str) -> Control | None:
-    return CONTROLS_BY_ID.get(control_id)
 
 
 def known_control_ids() -> set[str]:

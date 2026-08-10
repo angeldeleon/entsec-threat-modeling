@@ -42,7 +42,7 @@ from .analyze.engine import AnalysisError, Analyzer
 from .baseline import BaselineStore, StateError, apply_baseline, state_scope
 from .config import Config, load_config
 from .controls.catalog import BUILTIN_CONTROLS, frameworks_covered
-from .intake import blank_form, load_intake
+from .intake import blank_form, load_intake, scrub_intake
 from .models import Intake
 from .validation import ValidationError, safe_text
 
@@ -77,6 +77,13 @@ def _attach_document(intake: Intake, path: str | None) -> None:
     questionnaire is structured and summarised before it is sent, whereas the
     document goes verbatim because prose cannot be summarised without losing
     what makes it useful. That is worth a warning rather than a silent default.
+
+    Verbatim is not the same as unexamined. The document went straight from the
+    file into the prompt for a while, so the one input most likely to hold a
+    real credential -- an architecture note with a connection string in it, a
+    runbook with a service-account key -- was the only input nothing redacted,
+    while the README said credential shapes were removed before anything was
+    sent. It goes through the same scrub as the answers now.
     """
     if not path:
         return
@@ -89,8 +96,10 @@ def _attach_document(intake: Intake, path: str | None) -> None:
             "section that matters, or rely on the questionnaire alone."
         )
     intake.document_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    scrub_intake(intake)
     log.info(
-        "attached %s (%d lines) — its full text is sent to the analysis API",
+        "attached %s (%d lines) — its full text is sent to the analysis API, with "
+        "credential shapes redacted",
         file_path.name,
         len(intake.document_lines),
     )

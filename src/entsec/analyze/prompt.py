@@ -129,12 +129,15 @@ ANALYSIS_TOOL: dict[str, Any] = {
                     "properties": {
                         "text": {"type": "string"},
                         "why_it_matters": {"type": "string"},
-                        "blocks_decision": {
-                            "type": "boolean",
-                            "description": "True only if the answer would change the outcome.",
-                        },
                     },
-                    "required": ["text", "why_it_matters", "blocks_decision"],
+                    # There is deliberately no "blocks_decision" here. Whether
+                    # an open question holds the review is what turns an
+                    # approval into insufficient-information, so it is part of
+                    # the decision, and the decision is computed from the
+                    # intake. Asking for a flag and then ignoring it would be
+                    # worse than not asking: anyone reading the schema would
+                    # reasonably assume it counted for something.
+                    "required": ["text", "why_it_matters"],
                 },
                 "description": (
                     "What you would ask the requesting team that the form did not cover. "
@@ -238,11 +241,12 @@ def build_user_message(intake: Intake, gaps: list[ControlGap], applicable: list[
             "</already_reported_gaps>",
         ]
 
-    if intake.unanswered:
+    already_asked = list(intake.unanswered) + list(intake.vocabulary_notes)
+    if already_asked:
         sections += [
             "",
             "<already_asked>",
-            *(f"- {q}" for q in intake.unanswered[:20]),
+            *(f"- {q}" for q in already_asked[:20]),
             "</already_asked>",
         ]
 

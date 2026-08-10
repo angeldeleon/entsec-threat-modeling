@@ -23,19 +23,31 @@ depends on.
 The parser is strict about structure and forgiving about content: unknown keys
 are rejected outright, but a field it cannot interpret becomes an unanswered
 question rather than an error, so one odd answer never blocks a whole review.
+
+Everything a requester typed leaves this module sanitised and redacted, and
+:func:`scrub_intake` is where that is guaranteed rather than intended -- see its
+docstring for why the guarantee is made over the finished model rather than at
+each of the thirty places that build one.
 """
 
 from __future__ import annotations
 
+from dataclasses import fields, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from ..models import DataClass, Fact, Hosting, Intake, Integration, UserPopulation
-from ..validation import ValidationError, redact, safe_text
+from ..validation import ValidationError, sanitise
 
 _MAX_INTAKE_BYTES = 512 * 1024
+
+# One line of an attached design document. Long enough for prose and a wide
+# table row; a line past it is a minified blob or a data dump, which is not
+# something a reviewer was going to read anyway.
+_MAX_DOCUMENT_LINE = 1000
 
 # The questions, in the order they appear on the form. Kept here rather than
 # scattered through the parser so `entsec questions` can print the blank form
@@ -160,13 +172,16 @@ def clean(value: object, *, limit: int = 600) -> str:
     "where do the logs go" -- routinely, and without thinking, because the form
     asks a technical question and they answer it with the technical detail.
 
-    Redaction happens here rather than at the renderers for the same reason it
-    happens at extraction in the sibling tools: there are four sinks (the API
-    payload, the Markdown report, the HTML report, the review database) and
-    doing it at each means eventually forgetting one. Doing it once, at the
-    boundary where untrusted text enters, means no downstream code has to know.
+    Redaction happens here rather than at the renderers because there are four
+    sinks -- the API payload, the Markdown report, the HTML report, the review
+    database -- and doing it at each means eventually forgetting one. Doing it
+    once, at the boundary where untrusted text enters, means no downstream code
+    has to know.
+
+    Calling this at every parse site is still a discipline rather than a
+    guarantee, which is what :func:`scrub_intake` is for.
     """
-    return safe_text(redact(str(value)), limit=limit)
+    return sanitise(value, limit=limit)
 
 
 def _tri_bool(value: Any) -> bool | None:
@@ -231,7 +246,16 @@ def _parse_integrations(value: Any) -> tuple[list[Integration], list[str]]:
         if isinstance(entry, str):
             # Bare name. Everything about it is unknown, which the controls
             # layer will notice -- better than dropping the connection entirely.
-            integrations.append(Integration(name=safe_text(entry, limit=120), direction="unknown"))
+            #
+            # Cleaned like every other answer. This branch sanitised without
+            # redacting for a while, and a requester who wrote
+            # `integrations: [postgres://svc:pw@db/app]` -- the obvious way to
+            # answer "what does it connect to" -- had the password sent to the
+            # API and written into the JSON report, while the same string in
+            # the mapping form below was redacted. One field clear and its
+            # neighbour redacted is worse than either alone: it reads as
+            # deliberate.
+            integrations.append(Integration(name=clean(entry, limit=120), direction="unknown"))
             continue
         if not isinstance(entry, dict):
             problems.append("an integration entry was not a name or a mapping and was ignored")
@@ -376,21 +400,88 @@ def parse_intake(raw: Any, *, source: str = "intake") -> Intake:
 
     intake.facts = facts
     intake.unanswered = unanswered
+    unanswered.extend(integration_problems)
 
     # Unrecognised vocabulary is reported, not silently dropped. A requester who
     # wrote "biometric data" deserves to be told it was not understood rather
     # than to receive a review that quietly ignored it.
+    #
+    # These quote the answer back, so they are the only questions in the review
+    # that contain intake text, and they are kept in their own list for exactly
+    # that reason. Interpolated raw into `unanswered` they inherited nothing:
+    # not the redaction, not the sanitising, and not the escaping the renderers
+    # apply by provenance -- so a data type of
+    # "biometric AKIA... ![](https://evil/px.png)\n\n## Approved" put a live
+    # key, a tracking pixel and a forged verdict heading into the report.
     for label, leftovers in (
         ("data type", unmapped_data),
         ("user group", unmapped_users),
     ):
         for value in leftovers:
-            unanswered.append(
-                f"The {label} '{value}' was not recognised. Confirm what it maps to, "
-                "because the controls that apply depend on it."
+            intake.vocabulary_notes.append(
+                f"The {label} '{clean(value, limit=120)}' was not recognised. Confirm what "
+                "it maps to, because the controls that apply depend on it."
             )
-    unanswered.extend(integration_problems)
 
+    return scrub_intake(intake)
+
+
+def _scrub_value(value: Any, *, limit: int) -> Any:
+    """Clean one attribute of the model, whatever shape it is in."""
+    # Enum members subclass str here, and cleaning one would replace it with a
+    # plain string that no longer compares equal to the member -- silently
+    # breaking every applicability rule that tests `DataClass.PII in
+    # i.data_classes`. They are drawn from a fixed vocabulary in this file
+    # anyway, so there is nothing in them to clean.
+    if value is None or isinstance(value, Enum | bool):
+        return value
+    if isinstance(value, str):
+        return clean(value, limit=limit)
+    if isinstance(value, Fact):
+        return replace(
+            value,
+            value=clean(value.value, limit=400),
+            source=clean(value.source, limit=120),
+        )
+    if isinstance(value, Integration):
+        return replace(
+            value,
+            name=clean(value.name, limit=120),
+            direction=clean(value.direction, limit=40),
+            auth_method=clean(value.auth_method, limit=160),
+            notes=clean(value.notes, limit=300),
+        )
+    if isinstance(value, list):
+        return [_scrub_value(item, limit=limit) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_value(item, limit=limit) for item in value)
+    return value
+
+
+def scrub_intake(intake: Intake) -> Intake:
+    """Sanitise and redact every string on a finished intake. The choke point.
+
+    Calling :func:`clean` at each parse site is a discipline, and disciplines
+    fail quietly. Three fields reached the API with credentials in them because
+    of exactly that: a bare-string integration entry that took a different
+    branch, the unrecognised-vocabulary note that was built by interpolation
+    after parsing, and an attached design document that never went through the
+    parser at all. Each was one missing call, each looked fine in review, and
+    each was found only by grepping a payload for a key that should not have
+    been in it.
+
+    So the guarantee is made here instead, over the finished model: walk every
+    field, clean every string, and a field added next year is covered by the
+    walk whether or not whoever adds it reads this file. It runs at the end of
+    :func:`parse_intake` and again when a design document is attached, which is
+    the only other way text gets onto an intake.
+
+    Idempotent by construction -- ``<redacted:...>`` is not credential-shaped --
+    so running it twice costs a pass over a few kilobytes and nothing else.
+    """
+    for spec in fields(Intake):
+        limit = _MAX_DOCUMENT_LINE if spec.name == "document_lines" else 600
+        setattr(intake, spec.name, _scrub_value(getattr(intake, spec.name), limit=limit))
     return intake
 
 

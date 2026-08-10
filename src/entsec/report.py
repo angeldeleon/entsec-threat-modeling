@@ -94,6 +94,19 @@ def _md(text: object) -> str:
     return escaped
 
 
+def _prose(text: object, *, trusted: bool) -> str:
+    r"""Render one line of prose according to where it came from.
+
+    Provenance is decided once, here, so it reads the same at every call site.
+    Both halves of getting it wrong have happened in this file: question text
+    went out unescaped for every question in the review, including the ones
+    quoting an answer somebody typed, and review notes went out escaped even
+    though every one of them is written in this repository, so the reader was
+    told "3 proposed finding\(s\) were rejected".
+    """
+    return str(text) if trusted else _md(text)
+
+
 def _code(text: object) -> str:
     """Prepare a value for inside a Markdown code span.
 
@@ -165,8 +178,8 @@ def render_markdown(review: Review) -> str:
             # Escaped only when it came from the model. Catalog remediation is
             # written in this repository, and escaping it printed
             # "\(SAML or OIDC\)" at the reader.
-            lines.append(f"{index}. {action if trusted else _md(action)}")
-            lines.append(f"   *Why: {reason if trusted else _md(reason)}*")
+            lines.append(f"{index}. {_prose(action, trusted=trusted)}")
+            lines.append(f"   *Why: {_prose(reason, trusted=trusted)}*")
         lines.append("")
 
     if blocking_questions:
@@ -180,9 +193,9 @@ def render_markdown(review: Review) -> str:
             "",
         ]
         for question in blocking_questions[:10]:
-            lines.append(f"- {question.text}")
+            lines.append(f"- {_prose(question.text, trusted=question.trusted)}")
             if question.why_it_matters:
-                lines.append(f"  *{question.why_it_matters}*")
+                lines.append(f"  *{_prose(question.why_it_matters, trusted=question.trusted)}*")
         lines.append("")
 
     # ---- The reviewer's half --------------------------------------------
@@ -217,7 +230,7 @@ def render_markdown(review: Review) -> str:
     other_questions = [q for q in review.questions if not q.blocks_decision]
     if other_questions:
         lines += [f"## Open questions ({len(other_questions)})", ""]
-        lines += [f"- {q.text}" for q in other_questions[:20]]
+        lines += [f"- {_prose(q.text, trusted=q.trusted)}" for q in other_questions[:20]]
         lines.append("")
 
     if review.satisfied_controls:
@@ -241,8 +254,13 @@ def render_markdown(review: Review) -> str:
             "",
         ]
 
+    # Notes are written in this repository -- the confidence sentence, the
+    # rejection count, the fingerprint comparison -- so they are not escaped.
+    # Escaping them printed "finding\(s\)" and "review \(fingerprint 3f2a\)",
+    # which is the same carelessness the reader would read into a backslash
+    # anywhere else on the page.
     if review.notes:
-        lines += ["## Review notes", ""] + [f"- {_md(n)}" for n in review.notes[:12]] + [""]
+        lines += ["## Review notes", ""] + [f"- {n}" for n in review.notes[:12]] + [""]
 
     lines += [
         "---",
@@ -326,7 +344,7 @@ def render_check(review: Review) -> str:
     blocking = review.blocking_questions()
     if blocking:
         lines += ["## Questions blocking the decision", ""]
-        lines += [f"- {q.text}" for q in blocking[:15]]
+        lines += [f"- {_prose(q.text, trusted=q.trusted)}" for q in blocking[:15]]
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

@@ -91,13 +91,16 @@ jobs:
       - name: The decision is never read from model output
         run: |
           set -euo pipefail
-          if grep -rn 'raw.get("decision")\|raw\[.decision.\]\|get("severity")' src/entsec/; then
-            echo "::error::a model-supplied decision or severity is being read"; exit 1
+          if grep -rn 'raw.get("decision")\|raw\[.decision.\]\|get("severity")\|get("blocks_decision")' src/entsec/; then
+            echo "::error::a model-supplied decision, severity or blocking flag is being read"
+            exit 1
           fi
           python - <<'PY'
           import sys
           from entsec.controls.evaluate import decide, evaluate
           from entsec.intake import parse_intake
+          from entsec.models import Question
+          from entsec.review import _merge_questions
           intake = parse_intake({"system": "S", "users": ["public"],
                                  "data_classes": ["personal data"], "internet_facing": "yes"})
           gaps, questions, _, _ = evaluate(intake)
@@ -107,7 +110,53 @@ jobs:
               sys.exit("the decision is not reproducible")
           if first.value != "changes_required":
               sys.exit(f"expected changes_required for a blocking design, got {first.value}")
+          # A blocking question is what turns an approval into
+          # insufficient-information and what makes the exit code 1, so nothing
+          # arriving from the analysis layer may set one.
+          merged = _merge_questions([], [Question(text="q", blocks_decision=True, trusted=False)])
+          if any(q.blocks_decision for q in merged):
+              sys.exit("a question from the analysis layer was allowed to block the decision")
           print(f"decision computed and reproducible: {first.value}")
+          PY
+
+      - name: Nothing credential-shaped leaves the boundary
+        # The README says credential shapes are redacted before anything is
+        # sent. A free-text answer, a bare integration entry and the attached
+        # document have each broken that claim, and each was one missing call.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from entsec.analyze.prompt import build_user_message
+          from entsec.controls.evaluate import evaluate
+          from entsec.intake import parse_intake, scrub_intake
+          from entsec.report import render_html, render_json, render_markdown
+          from entsec.review import check
+          secrets = ["AKIAIOSFODNN7EXAMPLE", "hunter2", "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+          intake = parse_intake({
+              "system": "S",
+              "requesting_team": "IT",
+              "users": ["employees"],
+              "data_classes": ["internal", "biometric AKIAIOSFODNN7EXAMPLE"],
+              "privileged_roles": "svc key AKIA​IOSFODNN7EXAMPLE",
+              "network_notes": "db at postgres://svc:hunter2@db.internal:5432/app",
+              "integrations": ["postgres://svc:hunter2@db.internal:5432/app"],
+          })
+          intake.document_lines = ["CI: token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+          scrub_intake(intake)
+          gaps, _, applicable, _ = evaluate(intake)
+          result = check(intake)
+          sinks = {
+              "API payload": build_user_message(intake, gaps, applicable),
+              "markdown report": render_markdown(result),
+              "json report": render_json(result),
+              "html report": render_html(result),
+          }
+          for name, text in sinks.items():
+              for secret in secrets:
+                  if secret in text:
+                      sys.exit(f"{secret!r} reached the {name}")
+          print(f"no credential shape reached any of: {', '.join(sinks)}")
           PY
 
       - name: Unknown is never treated as absent
@@ -172,7 +221,17 @@ jobs:
           entsec check -i intake.example.yml -o review.md || true
           grep -q "Changes required" review.md
           grep -q "TPR-02" review.md
-          grep -qv 'gap\\(s\\)' review.md
+          # `grep -qv PATTERN` was here, and it can never fail: -v inverts per
+          # line, so it exits 0 as long as ONE line lacks the pattern. The
+          # invariant it was meant to hold -- that prose written in this
+          # repository is not escaped as though a requester had typed it -- was
+          # unguarded for as long as it was written that way, and the report
+          # was in fact printing "finding\(s\)" at the reader.
+          if grep -q '\\(' review.md; then
+            echo "::error::tool-authored prose was escaped; see report._prose"
+            grep -n '\\(' review.md
+            exit 1
+          fi
           echo "example review renders correctly"
 
       - name: An empty intake exits 2, not 0
