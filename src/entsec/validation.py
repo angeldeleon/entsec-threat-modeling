@@ -27,10 +27,14 @@ see its docstring for the bug that ordering it the other way produced.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
+from pathlib import Path
 
 __all__ = [
     "ValidationError",
+    "read_text_file",
     "redact",
     "safe_text",
     "sanitise",
@@ -186,6 +190,75 @@ def sanitise(value: object, *, limit: int = _MAX_FIELD_LENGTH) -> str:
     """
     normalised = safe_text(value, limit=_MAX_SCANNED_LENGTH)
     return safe_text(redact(normalised), limit=limit)
+
+
+_READ_CHUNK = 1024 * 1024
+
+
+def read_text_file(path: str | Path, *, max_bytes: int, what: str = "file") -> str:
+    """Read one file through a descriptor, refusing anything that is not a regular file.
+
+    Used for every file this tool opens -- the config, the intake form, and the
+    design document attached with ``-d`` -- and written this way rather than as
+    ``Path.read_text()`` because of where those files come from. An intake form
+    arrives by email and gets saved into a shared folder; a design document is
+    saved into the same one. The account running the review is often not the
+    account that put them there.
+
+    * ``O_NOFOLLOW``, because following a symlink out of that folder would let
+      whoever can write it aim this reader at any file the reviewer's account can
+      open -- and the contents of the file it reaches go into the review, and
+      with ``review`` into an API request. ELOOP surfaces as a refusal.
+    * ``O_NONBLOCK``, because a FIFO at the path blocks inside ``os.open``,
+      before the regular-file check can refuse it, and would hang the command
+      with no timeout and nothing in the log. Cleared once the descriptor is
+      known to be a regular file.
+    * The size is checked from ``fstat`` before reading and again while reading:
+      the first tells the truth about a regular file, the second catches one that
+      grows underneath us. ``stat()`` followed by ``open()`` checked one name and
+      read another.
+
+    Decoding is lossy on purpose. A design document exported from a wiki is full
+    of ligatures and stray bytes, and refusing to read it over one undecodable
+    character would turn "the document is unusual" into "the review did not run".
+    """
+    file_path = Path(path).expanduser()
+    try:
+        fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError as exc:
+        raise ValidationError(f"{what} not found: {file_path}") from exc
+    except OSError as exc:
+        # ELOOP lands here: the path is a symlink and we refused to follow it.
+        raise ValidationError(f"cannot open {what} {file_path}: {exc}") from exc
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValidationError(f"{what} {file_path} is not a regular file; refusing to read it")
+        if info.st_size > max_bytes:
+            raise ValidationError(
+                f"{what} {file_path} is {info.st_size} bytes, above the {max_bytes} byte limit"
+            )
+        os.set_blocking(fd, True)
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValidationError(
+                    f"{what} {file_path} exceeds the {max_bytes} byte limit while reading"
+                )
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ValidationError(f"cannot read {what} {file_path}: {exc}") from exc
+    finally:
+        os.close(fd)
+
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def validate_env_var_name(name: str, *, where: str) -> str:

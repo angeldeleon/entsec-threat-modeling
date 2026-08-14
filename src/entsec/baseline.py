@@ -176,12 +176,23 @@ class BaselineStore:
             raise StateError(f"cannot open baseline at {self.path}: {exc}") from exc
 
     def _assert_regular_file(self) -> None:
-        """Confirm an existing baseline is a real file, checked through the fd."""
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)  # ELOOP on a symlink
+        """Confirm an existing baseline is a real file, checked through the fd.
+
+        ``O_NONBLOCK`` belongs here as much as ``O_NOFOLLOW``, and against the
+        same person. Opening a FIFO for reading blocks *inside* ``os.open``
+        until a writer appears, so the regular-file check below -- the check
+        that exists to reject exactly this -- never runs. A named pipe left at
+        the baseline path therefore hung every review indefinitely rather than
+        refusing the path: no error, no timeout, nothing in the log, and a
+        review that never finishes is a review nobody notices is missing.
+        Cleared once the descriptor is known to be a regular file.
+        """
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # ELOOP on a symlink
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise StateError(f"{self.path} is not a regular file; refusing to open it")
+            os.set_blocking(fd, True)
             if info.st_mode & 0o077:
                 os.fchmod(fd, 0o600)  # repaired through the descriptor, not the path
         finally:

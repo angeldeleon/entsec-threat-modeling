@@ -10,7 +10,7 @@ import yaml
 
 from .analyze.engine import DEFAULT_API_BASE, DEFAULT_MAX_TOKENS, DEFAULT_MODEL
 from .baseline import DEFAULT_RETAIN, DEFAULT_STATE_PATH
-from .validation import ValidationError, validate_env_var_name
+from .validation import ValidationError, read_text_file, validate_env_var_name
 
 _MAX_CONFIG_BYTES = 512 * 1024
 FORMATS = ("markdown", "md", "json", "html")
@@ -137,13 +137,11 @@ def parse_config(raw: Any) -> Config:
 
 
 def load_config(path: str | Path) -> Config:
-    file_path = Path(path).expanduser()
-    if not file_path.is_file():
-        raise ValidationError(f"config file not found: {file_path}")
-    if file_path.stat().st_size > _MAX_CONFIG_BYTES:
-        raise ValidationError(f"config file is above the {_MAX_CONFIG_BYTES} byte limit")
+    # Read through a descriptor rather than by path -- see
+    # :func:`entsec.validation.read_text_file` for what is being refused and why.
+    text = read_text_file(Path(path).expanduser(), max_bytes=_MAX_CONFIG_BYTES, what="config file")
     try:
-        raw = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ValidationError(f"config file is not valid YAML: {exc}") from exc
     return parse_config(raw or {})
