@@ -199,6 +199,69 @@ jobs:
           print("gate rejects invented facts and control ids")
           PY
 
+      - name: Every file the tool opens refuses a symlink and a FIFO
+        # The intake, the config, the attached document, the review that gets
+        # written and the baseline database are all read or written where
+        # somebody else can also write. Every os.open in the tree carries
+        # O_NOFOLLOW, and every read carries O_NONBLOCK as well, so a planted
+        # link cannot redirect them and a planted pipe cannot hang the run
+        # before the regular-file check.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for path in pathlib.Path("src/entsec").rglob("*.py"):
+              text = path.read_text()
+              for match in re.finditer(r"os\.open\((.*?)\)\n", text, re.S):
+                  call = match.group(1)
+                  if "O_NOFOLLOW" not in call:
+                      bad.append(f"{path}: os.open without O_NOFOLLOW")
+                  if "O_RDONLY" in call and "O_NONBLOCK" not in call:
+                      bad.append(f"{path}: read without O_NONBLOCK")
+              if path.name == "validation.py":
+                  continue  # defines the guarded reader, and names the call it replaces
+              for forbidden in ("read_text(", "write_text("):
+                  if forbidden in text:
+                      bad.append(f"{path}: {forbidden} bypasses the guarded reader")
+          if bad:
+              sys.exit("\n".join(bad))
+          print("every open is guarded")
+          PY
+
+      - name: The API host guard fails closed
+        # allow_internal exists for a self-hosted gateway. Everything else must
+        # be globally routable unicast, and anything unclassifiable is refused
+        # rather than skipped.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from entsec import httpclient
+          from entsec.validation import ValidationError
+          cases = {
+              "loopback": "127.0.0.1",
+              "rfc1918": "10.1.2.3",
+              "link-local": "169.254.169.254",
+              "ipv4-mapped": "::ffff:169.254.169.254",
+              "6to4": "2002:a9fe:a9fe::",
+              "nat64": "64:ff9b::a9fe:a9fe",
+              "cgnat": "100.64.1.1",
+              "scoped link-local": "fe80::1%eth0",
+              "unparseable": "not-an-address",
+          }
+          for label, address in cases.items():
+              httpclient.socket.getaddrinfo = lambda *a, _addr=address, **k: [(0, 0, 0, "", (_addr, 443))]
+              try:
+                  httpclient.assert_api_url("https://gateway.example/v1")
+              except ValidationError:
+                  continue
+              sys.exit(f"{label} ({address}) was accepted as a public API host")
+          httpclient.socket.getaddrinfo = lambda *a, **k: [(0, 0, 0, "", ("93.184.216.34", 443))]
+          httpclient.assert_api_url("https://api.example.com/v1")
+          print(f"all {len(cases)} non-public spellings refused, a public host still allowed")
+          PY
+
       - name: check runs with no API key
         run: |
           set -euo pipefail

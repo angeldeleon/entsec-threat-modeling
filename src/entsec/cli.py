@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -44,7 +46,7 @@ from .config import Config, load_config
 from .controls.catalog import BUILTIN_CONTROLS, frameworks_covered
 from .intake import blank_form, load_intake, scrub_intake
 from .models import Intake
-from .validation import ValidationError, safe_text
+from .validation import ValidationError, read_text_file, redact, safe_text
 
 __version__ = "0.1.0"
 
@@ -57,16 +59,100 @@ log = logging.getLogger("entsec")
 _MAX_DOC_BYTES = 400_000
 
 
+class _RedactingFilter(logging.Filter):
+    """Strip credential-shaped substrings from log records.
+
+    The backstop, not the strategy. Intake answers are redacted where they enter
+    and nothing here logs an answer on purpose -- but an error message quotes
+    what it failed on, and the one input most likely to hold a real credential is
+    a design document somebody else wrote. A filter on the handler catches the
+    line nobody thought about, including the one added next year.
+
+    Tracebacks are formatted separately by the Formatter and never pass through
+    ``record.getMessage()``, so they are redacted explicitly. A traceback is
+    exactly where a raw value tends to surface, because it carries the arguments
+    that caused the failure.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover - never let logging raise
+            return True
+
+        redacted = redact(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+
+        if record.exc_info:
+            try:
+                formatted = logging.Formatter().formatException(record.exc_info)
+            except Exception:  # pragma: no cover - defensive
+                formatted = ""
+            if formatted:
+                record.exc_text = redact(formatted)
+                record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact(record.exc_text)
+
+        return True
+
+
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     level = logging.DEBUG if verbose else logging.ERROR if quiet else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    handler.addFilter(_RedactingFilter())
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+    # httpx logs full request URLs at INFO. The API base is operator-supplied
+    # and a self-hosted gateway can carry a token in its path.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _write(text: str, destination: str | None) -> None:
+    """Write the review, owner-only, without following a link.
+
+    A review names a system, the team that asked for it, the person who owns it
+    and every gap the evaluation found -- which is a short list of where to
+    attack the organisation, written by the security team itself. Inheriting the
+    process umask left that world-readable on a shared host or a CI runner.
+
+    ``O_NOFOLLOW`` because reviews are usually written into a shared directory,
+    and a symlink planted at the path would otherwise redirect the document to a
+    file the attacker can read -- and then have the chmod below tighten *their*
+    target, locking its owner out of it. Failing is the right answer: a review
+    going somewhere unexpected is not a thing to recover from quietly.
+    """
     if not destination:
         sys.stdout.write(text)
         return
-    Path(destination).expanduser().write_text(text, encoding="utf-8")
+
+    path = Path(destination).expanduser()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        # ELOOP lands here: the path is a symlink and we refused to follow it.
+        raise ValidationError(f"cannot write the review to {path}: {exc}") from exc
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # O_CREAT leaves the mode of an existing file alone, and an output path
+        # is reused review after review, so set it explicitly too -- through the
+        # descriptor, never the path.
+        #
+        # Only for a regular file. `-o /dev/null` is how this tool's own CI runs
+        # `check` for its exit code, and chmod-ing a character device is either a
+        # permission error that breaks that or, running as root, a machine-wide
+        # change to /dev/null. There is nothing to protect on a device or a pipe
+        # anyway: no file is left behind to read.
+        if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
     log.info("wrote %s", destination)
 
 
@@ -88,14 +174,13 @@ def _attach_document(intake: Intake, path: str | None) -> None:
     if not path:
         return
     file_path = Path(path).expanduser()
-    if not file_path.is_file():
-        raise ValidationError(f"design document not found: {file_path}")
-    if file_path.stat().st_size > _MAX_DOC_BYTES:
-        raise ValidationError(
-            f"design document is above the {_MAX_DOC_BYTES} byte limit. Point at the "
-            "section that matters, or rely on the questionnaire alone."
-        )
-    intake.document_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    # Read through a descriptor, like every other file this tool opens. A design
+    # document is saved into a shared folder by whoever wrote it, and its whole
+    # text is sent to the analysis API -- so a symlink planted beside it chooses
+    # what gets transmitted, and a FIFO left there hangs the review. See
+    # :func:`entsec.validation.read_text_file`.
+    text = read_text_file(file_path, max_bytes=_MAX_DOC_BYTES, what="design document")
+    intake.document_lines = text.splitlines()
     scrub_intake(intake)
     log.info(
         "attached %s (%d lines) — its full text is sent to the analysis API, with "

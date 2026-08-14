@@ -7,6 +7,10 @@ that moves between runs on the same inputs is worth nothing to anybody.
 
 from __future__ import annotations
 
+import logging
+import os
+import stat
+import sys
 import time
 from dataclasses import fields
 
@@ -863,3 +867,244 @@ class TestConditionProvenance:
         review.findings = kept
         rendered = render_markdown(review)
         assert "](https://evil.example)" not in rendered
+
+
+class TestFilesAreOpenedThroughADescriptor:
+    """An intake form arrives by email and is saved into a shared folder.
+
+    Whoever put it there is often not the account running the review, and the
+    text of every file named below reaches the review — and, with ``review``,
+    an API request.
+    """
+
+    def test_a_symlinked_intake_is_refused(self, tmp_path) -> None:
+        from entsec.intake import load_intake
+
+        target = tmp_path / "elsewhere.yml"
+        target.write_text("system: S\n", encoding="utf-8")
+        link = tmp_path / "intake.yml"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot open intake file"):
+            load_intake(link)
+
+    def test_a_symlinked_config_is_refused(self, tmp_path) -> None:
+        from entsec.config import load_config
+
+        target = tmp_path / "elsewhere.yml"
+        target.write_text("fail_on: high\n", encoding="utf-8")
+        link = tmp_path / "entsec.yml"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot open config file"):
+            load_config(link)
+
+    def test_a_symlinked_design_document_is_refused(self, tmp_path) -> None:
+        target = tmp_path / "id_rsa"
+        target.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
+        link = tmp_path / "design.md"
+        link.symlink_to(target)
+
+        intake = _intake()
+        with pytest.raises(ValidationError, match="cannot open design document"):
+            _attach_document(intake, str(link))
+        assert intake.document_lines == []
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_intake_fails_rather_than_hanging(self, tmp_path) -> None:
+        """O_NONBLOCK is the difference between a refusal and a review that never returns."""
+        from entsec.intake import load_intake
+
+        path = tmp_path / "intake.yml"
+        os.mkfifo(path)
+
+        with pytest.raises(ValidationError, match="not a regular file"):
+            load_intake(path)
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_baseline_fails_rather_than_hanging(self, tmp_path) -> None:
+        """The regular-file check ran after the open, so it never got to run."""
+        from entsec.baseline import BaselineStore, StateError
+
+        path = tmp_path / "reviews.db"
+        os.mkfifo(path)
+
+        with pytest.raises(StateError, match="not a regular file"):
+            BaselineStore(path, scope="s").previous()
+
+    def test_a_real_intake_is_still_read(self, tmp_path) -> None:
+        from entsec.intake import load_intake
+
+        path = tmp_path / "intake.yml"
+        path.write_text("system: Real System\nusers: [employees]\n", encoding="utf-8")
+        assert load_intake(path).system == "Real System"
+
+
+class TestTheReviewIsWrittenSafely:
+    """A review is a short list of where to attack the organisation."""
+
+    def _review(self):
+        return render_markdown(check(_intake()))
+
+    def test_the_review_is_written_owner_only(self, tmp_path) -> None:
+        from entsec.cli import _write
+
+        path = tmp_path / "review.md"
+        _write(self._review(), str(path))
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_permissive_file_from_a_previous_review_is_tightened(self, tmp_path) -> None:
+        from entsec.cli import _write
+
+        path = tmp_path / "review.md"
+        path.write_text("stale", encoding="utf-8")
+        os.chmod(path, 0o644)
+        _write(self._review(), str(path))
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_symlinked_output_path_is_refused(self, tmp_path) -> None:
+        from entsec.cli import _write
+
+        target = tmp_path / "victim.txt"
+        target.write_text("original", encoding="utf-8")
+        os.chmod(target, 0o644)
+        link = tmp_path / "review.md"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot write the review"):
+            _write(self._review(), str(link))
+
+        assert target.read_text(encoding="utf-8") == "original"
+        # The chmod is the second half of the attack: it locks the owner out.
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+class TestApiHostClassification:
+    """The API base is operator-configurable, which is why the guard exists."""
+
+    def test_a_scoped_link_local_address_is_still_classified(self, monkeypatch) -> None:
+        """getaddrinfo returns fe80::1%eth0 for a link-local answer. The scope
+        says nothing about routability, so it is dropped before classifying."""
+        from entsec import httpclient
+
+        monkeypatch.setattr(
+            httpclient.socket,
+            "getaddrinfo",
+            lambda *a, **k: [(0, 0, 0, "", ("fe80::1%eth0", 443, 0, 2))],
+        )
+        with pytest.raises(ValidationError, match="not a public address"):
+            httpclient.assert_api_url("https://gateway.example/v1/messages")
+
+    def test_carrier_grade_nat_is_refused(self, monkeypatch) -> None:
+        """100.64.0.0/10 is neither private nor reserved on every supported
+        Python, and it is where a cloud provider's own services sit."""
+        from entsec import httpclient
+
+        monkeypatch.setattr(
+            httpclient.socket,
+            "getaddrinfo",
+            lambda *a, **k: [(0, 0, 0, "", ("100.64.1.1", 443))],
+        )
+        with pytest.raises(ValidationError, match="not a public address"):
+            httpclient.assert_api_url("https://gateway.example/v1/messages")
+
+    def test_an_unparseable_address_fails_closed(self, monkeypatch) -> None:
+        from entsec import httpclient
+
+        monkeypatch.setattr(
+            httpclient.socket,
+            "getaddrinfo",
+            lambda *a, **k: [(0, 0, 0, "", ("not-an-address", 443))],
+        )
+        with pytest.raises(ValidationError, match="not a parseable address"):
+            httpclient.assert_api_url("https://gateway.example/v1/messages")
+
+    def test_a_public_address_is_still_allowed(self, monkeypatch) -> None:
+        from entsec import httpclient
+
+        monkeypatch.setattr(
+            httpclient.socket,
+            "getaddrinfo",
+            lambda *a, **k: [(0, 0, 0, "", ("93.184.216.34", 443))],
+        )
+        assert httpclient.assert_api_url("https://api.example.com/v1/messages")
+
+    def test_allow_internal_still_permits_a_named_gateway(self, monkeypatch) -> None:
+        from entsec import httpclient
+
+        monkeypatch.setattr(
+            httpclient.socket,
+            "getaddrinfo",
+            lambda *a, **k: [(0, 0, 0, "", ("10.1.2.3", 443))],
+        )
+        assert httpclient.assert_api_url("https://gateway.internal/v1", allow_internal=True)
+
+
+class TestBareUrlQuarantine:
+    """An answer needs no Markdown syntax at all to put a live link in a review."""
+
+    def test_a_bare_url_is_moved_into_a_code_span(self) -> None:
+        assert "`https://evil.example/approve`" in _md("see https://evil.example/approve")
+
+    def test_a_www_url_is_quarantined_too(self) -> None:
+        assert "`www.evil.example/approve`" in _md("see www.evil.example/approve")
+
+    def test_an_answer_cannot_autolink_into_the_review(self) -> None:
+        """The system name is written by the requesting team and heads the
+        document every reader opens."""
+        intake = _intake(system="Portal https://evil.example/ticket")
+        rendered = render_markdown(check(intake))
+        assert "`https://evil.example/ticket`" in rendered
+
+    def test_tool_authored_prose_is_still_not_escaped(self) -> None:
+        rendered = render_check(check(_intake(mfa="no", users=["employees"])))
+        assert "\\(" not in rendered
+
+
+class TestLogRedaction:
+    """The backstop for the line nobody thought about."""
+
+    def _record(self, message: str, exc_info=None) -> logging.LogRecord:
+        return logging.LogRecord("entsec", logging.ERROR, __file__, 1, message, None, exc_info)
+
+    def test_a_credential_in_a_message_is_redacted(self) -> None:
+        from entsec.cli import _RedactingFilter
+
+        record = self._record("could not parse: password=hunter2hunter2")
+        _RedactingFilter().filter(record)
+        assert "hunter2hunter2" not in record.getMessage()
+
+    def test_a_credential_in_a_traceback_is_redacted(self) -> None:
+        """Tracebacks are formatted separately and bypass getMessage()."""
+        from entsec.cli import _RedactingFilter
+
+        try:
+            raise RuntimeError("connecting to postgres://svc:hunter2hunter2@db.internal/app")
+        except RuntimeError:
+            record = self._record("failed", exc_info=sys.exc_info())
+
+        _RedactingFilter().filter(record)
+        assert record.exc_text is not None
+        assert "hunter2hunter2" not in record.exc_text
+        assert record.exc_info is None
+
+    def test_ordinary_text_is_left_alone(self) -> None:
+        from entsec.cli import _RedactingFilter
+
+        record = self._record("reviewed 12 controls")
+        _RedactingFilter().filter(record)
+        assert record.getMessage() == "reviewed 12 controls"
+
+
+class TestADevicePathIsStillWritable:
+    """`entsec check -i intake.yml -o /dev/null` is how this tool's own CI runs
+    the command for its exit code. The 0600 is for a real file; chmod-ing a
+    character device is either a permission error or, as root, a machine-wide
+    change to /dev/null."""
+
+    def test_writing_to_dev_null_neither_fails_nor_chmods_it(self) -> None:
+        from entsec.cli import _write
+
+        before = stat.S_IMODE(os.stat("/dev/null").st_mode)
+        _write("anything", "/dev/null")
+        assert stat.S_IMODE(os.stat("/dev/null").st_mode) == before

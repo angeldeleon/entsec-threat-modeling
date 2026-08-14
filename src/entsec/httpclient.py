@@ -45,9 +45,20 @@ def _classify(host: str, *, allow_internal: bool) -> None:
     for info in infos:
         raw = info[4][0]
         try:
-            address = ipaddress.ip_address(raw)
-        except ValueError:
-            continue
+            # An IPv6 sockaddr can carry a scope id -- fe80::1%eth0. Recent
+            # Pythons parse that form and keep the scope; the split makes the
+            # classification independent of which ones do, since the scope says
+            # nothing about whether the address is routable.
+            address = ipaddress.ip_address(str(raw).split("%", 1)[0])
+        except ValueError as exc:
+            # Fail closed. Skipping the entry on a parse failure was the wrong
+            # half of the choice: an address this cannot parse is one it cannot
+            # classify, and if it is the only one the host resolves to, the loop
+            # ended with nothing checked and the request went ahead. "We could
+            # not tell" must never read as "it is fine".
+            raise ValidationError(
+                f"{host} resolves to {raw!r}, which is not a parseable address"
+            ) from exc
 
         # IPv4-mapped and 6to4 spellings reach the same address through a
         # different notation. Checking only the textual form would let
@@ -67,6 +78,13 @@ def _classify(host: str, *, allow_internal: bool) -> None:
             or address.is_reserved
             or address.is_multicast
             or address.is_unspecified
+            # Last, and not redundant with the flags above. 100.64.0.0/10 is
+            # carrier-grade NAT -- where a cloud provider's own internal
+            # services sit -- and it is neither private nor reserved on every
+            # Python version this supports. The named flags catch what they
+            # name; this catches everything else that is not globally routable
+            # unicast.
+            or not address.is_global
         ):
             raise ValidationError(
                 f"{host} resolves to {address}, which is not a public address. "

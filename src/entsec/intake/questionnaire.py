@@ -40,7 +40,7 @@ from typing import Any
 import yaml
 
 from ..models import DataClass, Fact, Hosting, Intake, Integration, UserPopulation
-from ..validation import ValidationError, sanitise
+from ..validation import ValidationError, read_text_file, sanitise
 
 _MAX_INTAKE_BYTES = 512 * 1024
 
@@ -488,15 +488,14 @@ def scrub_intake(intake: Intake) -> Intake:
 def load_intake(path: str | Path) -> Intake:
     """Read and validate an intake file."""
     file_path = Path(path).expanduser()
-    if not file_path.is_file():
-        raise ValidationError(f"intake file not found: {file_path}")
-    size = file_path.stat().st_size
-    if size > _MAX_INTAKE_BYTES:
-        raise ValidationError(f"intake file is {size} bytes, above the {_MAX_INTAKE_BYTES} limit")
+    # Read through a descriptor rather than by path. This one arrives by email
+    # and is saved into a shared folder by somebody else -- see
+    # :func:`entsec.validation.read_text_file`.
+    text = read_text_file(file_path, max_bytes=_MAX_INTAKE_BYTES, what="intake file")
     try:
         # safe_load only: full load constructs arbitrary Python objects, which
         # would turn a form filled in by another team into code execution here.
-        raw = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ValidationError(f"the intake file is not valid YAML: {exc}") from exc
     return parse_intake(raw or {}, source=file_path.name)

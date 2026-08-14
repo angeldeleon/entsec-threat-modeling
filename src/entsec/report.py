@@ -65,6 +65,18 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 # ``on_prem`` as ``on\_prem`` and the worst they achieve is bold text.
 _MD_ESCAPE_RE = re.compile(r"([`\[\]()!])")
 
+# A bare URL needs none of the metacharacters above. GitHub-flavoured Markdown,
+# and the ticket systems a review gets pasted into, autolink ``https://…`` and
+# ``www.…`` on sight — so an answer reading ``see https://evil.example/approval``
+# still puts a live link in a document that carries the security team's name,
+# which is the outcome the escaping above exists to prevent, reached without a
+# single escapable character. Escaping cannot fix it: the autolinker matches the
+# shape of the text, not a metacharacter. Autolinking never happens inside a code
+# span in any CommonMark implementation, so a URL-shaped run is moved into one
+# instead. The run stops at whitespace and at a backtick, so the span it opens
+# always closes.
+_BARE_URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*:/{2}|www\.|mailto:|xmpp:)[^\s`]*")
+
 
 def _md(text: object) -> str:
     r"""Escape UNTRUSTED text for Markdown prose.
@@ -86,12 +98,33 @@ def _md(text: object) -> str:
     Getting this backwards in either direction is a real failure: escape too
     little and a report carries a payload, escape too much and nobody trusts a
     document that cannot punctuate.
+
+    URL-shaped runs are quarantined rather than escaped, for the reason given on
+    :data:`_BARE_URL_RE`: no metacharacter is involved, so there is nothing to
+    escape.
     """
     collapsed = " ".join(_CONTROL_CHARS_RE.sub(" ", str(text)).split())
-    escaped = _MD_ESCAPE_RE.sub(r"\\\1", collapsed).replace("<", "&lt;")
+
+    out: list[str] = []
+    position = 0
+    for match in _BARE_URL_RE.finditer(collapsed):
+        out.append(_escape_run(collapsed[position : match.start()]))
+        # Entity-escaped inside the span for the reason :func:`_code` gives: a
+        # renderer that mishandles code spans should not be the only thing
+        # standing between an answer somebody typed and an ``<img>`` tag.
+        out.append("`" + match.group().replace("<", "&lt;").replace(">", "&gt;") + "`")
+        position = match.end()
+    out.append(_escape_run(collapsed[position:]))
+
+    escaped = "".join(out)
     if escaped.startswith(">"):
         escaped = "&gt;" + escaped[1:]
     return escaped
+
+
+def _escape_run(text: str) -> str:
+    """Escape the Markdown metacharacters in a run of ordinary text."""
+    return _MD_ESCAPE_RE.sub(r"\\\1", text).replace("<", "&lt;")
 
 
 def _prose(text: object, *, trusted: bool) -> str:
